@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""garlic - CLI tool for PS4/PS5 save management via HTOS API."""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+
+DEFAULT_API_URL = "https://garlicsaves.com/api/v1"
+CONFIG_PATH = os.path.expanduser("~/.config/garlic/config.json")
+
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def get_key(args):
+    key = args.key or os.environ.get("GARLIC_API_KEY") or load_config().get("api_key")
+    if not key:
+        print("Error: No API key. Set with: garlic config --key YOUR_KEY", file=sys.stderr)
+        print("  Or pass -K KEY, or set GARLIC_API_KEY env var.", file=sys.stderr)
+        sys.exit(1)
+    return key
+
+
+def get_api_url(args):
+    return args.api_url or os.environ.get("GARLIC_API_URL") or load_config().get("api_url") or DEFAULT_API_URL
+
+
+# ── Platform detection ────────────────────────────────────────
+
+def detect_save_platform(filepath):
+    """Detect PS4 vs PS5 from first byte: 0x01=PS4, 0x02=PS5."""
+    try:
+        with open(filepath, "rb") as f:
+            header = f.read(4)
+        if len(header) >= 1:
+            if header[0] == 0x01:
+                return "ps4"
+            if header[0] == 0x02:
+                return "ps5"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def detect_platform_from_files(files):
+    """Detect platform from a list of file paths."""
+    for f in files:
+        basename = os.path.basename(f)
+        if basename.startswith("sdimg_"):
+            return "ps5"
+    for f in files:
+        if not f.lower().endswith(".bin"):
+            plat = detect_save_platform(f)
+            if plat != "unknown":
+                return plat
+    return "unknown"
+
+
+# ── File pairing ──────────────────────────────────────────────
+
+def find_sealed_key(save_path):
+    """Find the .bin sealed key for a save file."""
+    # Try exact match: savefile.bin
+    bin_path = save_path + ".bin"
+    if os.path.isfile(bin_path):
+        return bin_path
+    # Try in same directory
+    dirname = os.path.dirname(save_path) or "."
+    basename = os.path.basename(save_path)
+    for f in os.listdir(dirname):
+        if f.lower().endswith(".bin"):
+            # Check if base matches
+            if f[:-4] == basename:
+                return os.path.join(dirname, f)
+    return None
+
+
+def collect_save_pairs(save_paths, key_path=None):
+    """Given save file paths, find matching .bin sealed keys.
+    Returns list of (save_path, bin_path) tuples."""
+    pairs = []
+    for sp in save_paths:
+        if sp.lower().endswith(".bin"):
+            continue  # skip .bin files, they'll be matched
+        bp = key_path if key_path else find_sealed_key(sp)
+        if not bp:
+            print(f"Error: No sealed key (.bin) found for {sp}", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isfile(bp):
+            print(f"Error: Sealed key not found: {bp}", file=sys.stderr)
+            sys.exit(1)
+        pairs.append((sp, bp))
+    return pairs
+
+
+# ── Multipart form upload ─────────────────────────────────────
+
+def multipart_encode(fields, files):
+    """Build multipart/form-data body.
+    fields: list of (name, value) tuples
+    files: list of (field_name, filename, filepath) tuples
+    """
+    import uuid
+    boundary = uuid.uuid4().hex
+    body = b""
+    for name, value in fields:
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+    for field_name, filename, filepath in files:
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode()
+        body += b"Content-Type: application/octet-stream\r\n\r\n"
+        with open(filepath, "rb") as f:
+            body += f.read()
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def api_request(url, key, method="GET", data=None, content_type=None):
+    """Make an API request, return parsed JSON or raw bytes."""
+    headers = {"X-Worker-Key": key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            ct = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+            if "json" in ct:
+                return json.loads(raw)
+            return raw
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            err = json.loads(body)
+            print(f"Error {e.code}: {err.get('error', body)}", file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"Error {e.code}: {body}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Job submission & polling ──────────────────────────────────
+
+def submit_job(api_url, key, operation, fields, file_list):
+    """Submit a job and return job_id."""
+    fields.append(("operation", operation))
+    body, ct = multipart_encode(fields, file_list)
+    url = f"{api_url}/jobs"
+    result = api_request(url, key, method="POST", data=body, content_type=ct)
+    job_id = result.get("job_id")
+    if not job_id:
+        print(f"Error: Unexpected response: {result}", file=sys.stderr)
+        sys.exit(1)
+    return job_id
+
+
+def poll_job(api_url, key, job_id, quiet=False):
+    """Poll job until done/failed. Returns final status dict."""
+    url = f"{api_url}/jobs/{job_id}"
+    last_log_count = 0
+    while True:
+        result = api_request(url, key)
+        status = result.get("status", "unknown")
+        logs = result.get("logs", [])
+
+        if not quiet and len(logs) > last_log_count:
+            for log in logs[last_log_count:]:
+                if isinstance(log, dict):
+                    print(f"  [{log.get('level', '?')}] {log.get('msg', '')}")
+                else:
+                    print(f"  {log}")
+            last_log_count = len(logs)
+
+        if status in ("done", "failed"):
+            return result
+
+        time.sleep(3)
+
+
+def download_result(api_url, key, job_id, output_path):
+    """Download result zip."""
+    url = f"{api_url}/jobs/{job_id}/result"
+    data = api_request(url, key)
+    with open(output_path, "wb") as f:
+        f.write(data)
+    return output_path
+
+
+# ── Commands ──────────────────────────────────────────────────
+
+def cmd_decrypt(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+
+    save_files = args.save
+    key_path = args.sealed_key
+
+    # Detect platform early to know if sealed keys are needed
+    platform = detect_platform_from_files(save_files)
+    if platform == "unknown":
+        platform = "ps4"
+    print(f"Platform: {platform}")
+
+    file_list = []
+    if platform == "ps5":
+        # PS5 saves don't have separate sealed key files
+        for sp in save_files:
+            file_list.append(("files", os.path.basename(sp), sp))
+    else:
+        # PS4 requires save + sealed key (.bin) pairs
+        pairs = collect_save_pairs(save_files, key_path)
+        for sp, bp in pairs:
+            file_list.append(("files", os.path.basename(sp), sp))
+            file_list.append(("files", os.path.basename(bp), bp))
+
+    fields = []
+    if not args.no_sce_sys:
+        fields.append(("include_sce_sys", "true"))
+
+    count = len(save_files) if platform == "ps5" else len(pairs)
+    print(f"Submitting decrypt job ({count} save(s))...")
+    job_id = submit_job(api_url, key, "decrypt", fields, file_list)
+    print(f"Job: {job_id}")
+
+    result = poll_job(api_url, key, job_id)
+    if result["status"] == "done":
+        out = args.output or f"{job_id}_decrypted.zip"
+        download_result(api_url, key, job_id, out)
+        print(f"Downloaded: {out}")
+    else:
+        print(f"Job failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_encrypt(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+
+    folder = args.folder
+    if not os.path.isdir(folder):
+        print(f"Error: {folder} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    account_id = args.account_id
+    if not account_id:
+        print("Error: --account-id required for encrypt", file=sys.stderr)
+        sys.exit(1)
+
+    # Create zip of the folder
+    import zipfile
+    import tempfile
+    zip_path = tempfile.mktemp(suffix=".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for root, _, files in os.walk(folder):
+            for f in files:
+                filepath = os.path.join(root, f)
+                arcname = os.path.relpath(filepath, folder)
+                zf.write(filepath, arcname)
+
+    # Detect platform from param.sfo or flag
+    platform = args.platform or "ps4"
+
+    fields = [("account_id", account_id)]
+    if platform == "ps5":
+        fields.append(("platform", "ps5"))
+    file_list = [("files", "save.zip", zip_path)]
+
+    print(f"Submitting encrypt job (platform: {platform})...")
+    try:
+        job_id = submit_job(api_url, key, "encrypt", fields, file_list)
+    finally:
+        os.unlink(zip_path)
+    print(f"Job: {job_id}")
+
+    result = poll_job(api_url, key, job_id)
+    if result["status"] == "done":
+        out = args.output or f"{job_id}_encrypted.zip"
+        download_result(api_url, key, job_id, out)
+        print(f"Downloaded: {out}")
+    else:
+        print(f"Job failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_resign(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+
+    save_files = args.save
+    key_path = args.sealed_key
+
+    account_id = args.account_id
+    if not account_id:
+        print("Error: --account-id required for resign", file=sys.stderr)
+        sys.exit(1)
+
+    platform = detect_platform_from_files(save_files)
+    if platform == "unknown":
+        platform = "ps4"
+    print(f"Platform: {platform}")
+
+    file_list = []
+    if platform == "ps5":
+        for sp in save_files:
+            file_list.append(("files", os.path.basename(sp), sp))
+    else:
+        pairs = collect_save_pairs(save_files, key_path)
+        for sp, bp in pairs:
+            file_list.append(("files", os.path.basename(sp), sp))
+            file_list.append(("files", os.path.basename(bp), bp))
+
+    fields = [("account_id", account_id)]
+
+    print(f"Submitting resign job ({len(file_list)} file(s))...")
+    job_id = submit_job(api_url, key, "resign", fields, file_list)
+    print(f"Job: {job_id}")
+
+    result = poll_job(api_url, key, job_id)
+    if result["status"] == "done":
+        out = args.output or f"{job_id}_resigned.zip"
+        download_result(api_url, key, job_id, out)
+        print(f"Downloaded: {out}")
+    else:
+        print(f"Job failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_reregion(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+
+    save_files = args.save
+    key_path = args.sealed_key
+    sample_files = args.sample
+    sample_key = args.sample_key
+
+    account_id = args.account_id
+    if not account_id:
+        print("Error: --account-id required for reregion", file=sys.stderr)
+        sys.exit(1)
+
+    pairs = collect_save_pairs(save_files, key_path)
+    sample_pairs = collect_save_pairs(sample_files, sample_key)
+
+    file_list = []
+    for sp, bp in pairs:
+        file_list.append(("files", os.path.basename(sp), sp))
+        file_list.append(("files", os.path.basename(bp), bp))
+    for sp, bp in sample_pairs:
+        file_list.append(("sample", os.path.basename(sp), sp))
+        file_list.append(("sample", os.path.basename(bp), bp))
+
+    fields = [("account_id", account_id)]
+
+    print(f"Submitting reregion job...")
+    job_id = submit_job(api_url, key, "reregion", fields, file_list)
+    print(f"Job: {job_id}")
+
+    result = poll_job(api_url, key, job_id)
+    if result["status"] == "done":
+        out = args.output or f"{job_id}_reregioned.zip"
+        download_result(api_url, key, job_id, out)
+        print(f"Downloaded: {out}")
+    else:
+        print(f"Job failed: {result.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_status(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+    result = api_request(f"{api_url}/jobs/{args.job_id}", key)
+    print(f"Job:       {result.get('id')}")
+    print(f"Operation: {result.get('operation')}")
+    print(f"Status:    {result.get('status')}")
+    if result.get("error"):
+        print(f"Error:     {result['error']}")
+    if result.get("created_at"):
+        print(f"Created:   {result['created_at']}")
+    logs = result.get("logs", [])
+    if logs:
+        print("Logs:")
+        for log in logs:
+            if isinstance(log, dict):
+                print(f"  [{log.get('level', '?')}] {log.get('msg', '')}")
+            else:
+                print(f"  {log}")
+
+
+def cmd_download(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+    out = args.output or f"{args.job_id}_result.zip"
+    download_result(api_url, key, args.job_id, out)
+    print(f"Downloaded: {out}")
+
+
+def cmd_jobs(args):
+    key = get_key(args)
+    api_url = get_api_url(args)
+    result = api_request(f"{api_url}/jobs", key)
+    if not result:
+        print("No jobs found.")
+        return
+    fmt = "{:<38} {:<10} {:<8} {}"
+    print(fmt.format("ID", "Operation", "Status", "Created"))
+    print("-" * 80)
+    for j in result:
+        print(fmt.format(j["id"], j.get("operation", ""), j.get("status", ""), j.get("created_at", "")))
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.set_key:
+        cfg["api_key"] = args.set_key
+        save_config(cfg)
+        print("API key saved.")
+    elif args.set_url:
+        cfg["api_url"] = args.set_url
+        save_config(cfg)
+        print(f"API URL set to: {args.set_url}")
+    elif args.show:
+        if not cfg:
+            print("No config. Run: garlic config --key YOUR_KEY")
+        else:
+            for k, v in cfg.items():
+                val = v[:8] + "..." if k == "api_key" and len(v) > 8 else v
+                print(f"  {k}: {val}")
+    else:
+        print("Usage: garlic config --key YOUR_KEY")
+        print("       garlic config --url API_URL")
+        print("       garlic config --show")
+
+
+# ── Main ──────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="garlic",
+        description="PS4/PS5 save management CLI",
+    )
+    parser.add_argument("-K", "--key", help="API key (or set GARLIC_API_KEY)")
+    parser.add_argument("--api-url", help=f"API URL (default: {DEFAULT_API_URL})")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # decrypt
+    p = sub.add_parser("decrypt", aliases=["d"], help="Decrypt save files")
+    p.add_argument("save", nargs="+", help="Save file(s)")
+    p.add_argument("-k", "--sealed-key", help="Sealed key (.bin) file")
+    p.add_argument("-o", "--output", help="Output file path")
+    p.add_argument("--no-sce-sys", action="store_true", help="Exclude sce_sys from output")
+
+    # encrypt
+    p = sub.add_parser("encrypt", aliases=["e"], help="Encrypt a decrypted save folder")
+    p.add_argument("folder", help="Folder with decrypted save (must contain sce_sys/param.sfo)")
+    p.add_argument("-a", "--account-id", required=True, help="Account ID (hex)")
+    p.add_argument("-p", "--platform", choices=["ps4", "ps5"], default="ps4", help="Platform")
+    p.add_argument("-o", "--output", help="Output file path")
+
+    # resign
+    p = sub.add_parser("resign", aliases=["r"], help="Re-sign saves to different account")
+    p.add_argument("save", nargs="+", help="Save file(s)")
+    p.add_argument("-k", "--sealed-key", help="Sealed key (.bin) file")
+    p.add_argument("-a", "--account-id", required=True, help="Target account ID (hex)")
+    p.add_argument("-o", "--output", help="Output file path")
+
+    # reregion
+    p = sub.add_parser("reregion", aliases=["rr"], help="Re-region saves")
+    p.add_argument("save", nargs="+", help="Target save file(s)")
+    p.add_argument("-k", "--sealed-key", help="Sealed key (.bin) for target saves")
+    p.add_argument("-s", "--sample", nargs="+", required=True, help="Sample save file(s)")
+    p.add_argument("--sample-key", help="Sealed key (.bin) for sample saves")
+    p.add_argument("-a", "--account-id", required=True, help="Account ID (hex)")
+    p.add_argument("-o", "--output", help="Output file path")
+
+    # status
+    p = sub.add_parser("status", aliases=["s"], help="Check job status")
+    p.add_argument("job_id", help="Job ID")
+
+    # download
+    p = sub.add_parser("download", aliases=["dl"], help="Download job result")
+    p.add_argument("job_id", help="Job ID")
+    p.add_argument("-o", "--output", help="Output file path")
+
+    # jobs
+    sub.add_parser("jobs", aliases=["ls"], help="List recent jobs")
+
+    # config
+    p = sub.add_parser("config", help="Configure garlic")
+    p.add_argument("--key", dest="set_key", help="Set API key")
+    p.add_argument("--url", dest="set_url", help="Set API URL")
+    p.add_argument("--show", action="store_true", help="Show config")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    commands = {
+        "decrypt": cmd_decrypt, "d": cmd_decrypt,
+        "encrypt": cmd_encrypt, "e": cmd_encrypt,
+        "resign": cmd_resign, "r": cmd_resign,
+        "reregion": cmd_reregion, "rr": cmd_reregion,
+        "status": cmd_status, "s": cmd_status,
+        "download": cmd_download, "dl": cmd_download,
+        "jobs": cmd_jobs, "ls": cmd_jobs,
+        "config": cmd_config,
+    }
+
+    cmd = commands.get(args.command)
+    if cmd:
+        cmd(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
