@@ -135,7 +135,7 @@ def multipart_encode(fields, files):
 
 def api_request(url, key, method="GET", data=None, content_type=None):
     """Make an API request, return parsed JSON or raw bytes."""
-    headers = {"X-Worker-Key": key}
+    headers = {"X-Worker-Key": key, "User-Agent": "garlic-cli/1.0"}
     if content_type:
         headers["Content-Type"] = content_type
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
